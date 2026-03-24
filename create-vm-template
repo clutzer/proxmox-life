@@ -1,0 +1,51 @@
+#!/bin/sh
+
+# 1. Variables - Change these as needed
+VM_ID=9000
+VM_NAME="ubuntu-2404-template"
+STORAGE="local-lvm" # Change to 'zfspool' or 'ceph' if applicable
+IMG_NAME="noble-server-cloudimg-amd64.img"
+
+# 2. Download the official Ubuntu 24.04 Cloud Image
+# We use the .img (QCOW2) instead of ISO to skip the manual installer entirely.
+wget -N https://cloud-images.ubuntu.com/noble/current/$IMG_NAME
+
+# 3. Create the VM Shell
+# --net0: Uses VirtIO (fastest) and bridges to your physical network.
+qm create $VM_ID --name $VM_NAME --net0 virtio,bridge=vmbr0
+
+# 4. Set Hardware Specifications (Your 1 Socket, 2 Core, 2GB RAM request)
+# --cpu host: Passes through physical CPU flags (crucial for performance).
+# --numa 1: Helps with memory management on multi-socket servers.
+qm set $VM_ID --sockets 1 --cores 2 --memory 2048 --cpu host --numa 1
+
+# 5. Configure Storage and Controllers
+# --scsihw virtio-scsi-pci: The modern, high-performance SCSI controller.
+qm set $VM_ID --scsihw virtio-scsi-pci
+
+# 6. Import the Disk Image
+# This converts the downloaded image into a Proxmox-managed volume.
+qm importdisk $VM_ID $IMG_NAME $STORAGE
+
+# 7. Attach the Disk with "Operational Excellence" Flags
+# discard=on: Allows 'fstrim' to work, reclaiming deleted space on the host SSD.
+# ssd=1: Tells the Guest OS that the underlying storage is flash-based.
+qm set $VM_ID --scsi0 $STORAGE:vm-$VM_ID-disk-0,discard=on,ssd=1
+
+# 8. Add Cloud-Init & Serial Console
+# Cloud-init needs a virtual "drive" to read its configuration from.
+# The serial console is required to see boot logs if the GUI console fails.
+qm set $VM_ID --ide2 $STORAGE:cloudinit
+qm set $VM_ID --serial0 socket --vga serial0
+
+# 9. Set Boot Order and Guest Agent
+# --boot c: Boots from the first hard disk (scsi0).
+# --agent enabled=1: Enables the "Intercom" for IP reporting and clean shutdowns.
+qm set $VM_ID --boot c --bootdisk scsi0
+qm set $VM_ID --agent enabled=1
+
+# 10. Finalize into Template
+# This makes the VM read-only so it can be cloned instantly.
+qm template $VM_ID
+
+echo "Template $VM_ID created successfully!"

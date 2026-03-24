@@ -1,0 +1,15 @@
+#cloud-config
+users:
+  - name: mydefaultuser
+    groups: sudo
+    shell: /bin/bash
+    #sudo: 'ALL=(ALL) NOPASSWD:ALL'
+    ssh_authorized_keys:
+      - ssh-rsa AAAA user@example.com
+
+# Operational Excellence: auto-install and start QEMU guest agent
+packages:
+  - qemu-guest-agent
+
+#runcmd:
+#  - systemctl enable --now qemu-guest-agent

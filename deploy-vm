@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+import argparse
+import subprocess
+import sys
+
+# --- Configuration ---
+TEMPLATE_ID = "9000"
+EXPECTED_SNIPPET = "local:snippets/sa-user.yaml"
+DEFAULT_STORAGE = "nas-vm1"
+DEFAULT_DISK = 20
+DEFAULT_RAM = 2048
+DEFAULT_CORES = 2
+
+def run_command(cmd, error_msg=None):
+    try:
+        result = subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
+        return result.stdout
+    except subprocess.CalledProcessError as e:
+        print(f"ERROR: {error_msg if error_msg else 'Command failed'}")
+        print(f"Details: {e.stderr}")
+        sys.exit(1)
+
+def main():
+    parser = argparse.ArgumentParser(description="Deploy a Proxmox VM from a validated template.")
+    parser.add_argument("vmid", help="The ID for the new VM")
+    parser.add_argument("name", help="The name for the new VM")
+    parser.add_argument("-d", "--disk", type=int, default=DEFAULT_DISK, help="Disk size in GB")
+    parser.add_argument("-r", "--ram", type=int, default=DEFAULT_RAM, help="RAM in MB")
+    parser.add_argument("-c", "--cores", type=int, default=DEFAULT_CORES, help="CPU Cores")
+    parser.add_argument("-s", "--storage", default=DEFAULT_STORAGE, help="Target storage ID")
+    
+    args = parser.parse_args()
+
+    # 1. Validate Template
+    print(f"--- [1/4] Validating Template {TEMPLATE_ID} ---")
+    config = run_command(f"qm config {TEMPLATE_ID}")
+    if f"user={EXPECTED_SNIPPET}" not in config:
+        print(f"ERROR: Template {TEMPLATE_ID} is missing snippet: {EXPECTED_SNIPPET}")
+        sys.exit(1)
+
+    # 2. Clone
+    print(f"--- [2/4] Cloning to {args.storage} ---")
+    run_command(f"qm clone {TEMPLATE_ID} {args.vmid} --name {args.name} --full --storage {args.storage}")
+
+    # 3. Specialize
+    print(f"--- [3/4] Customizing: {args.cores} Cores, {args.ram}MB RAM, {args.disk}GB Disk ---")
+    run_command(f"qm set {args.vmid} --cores {args.cores} --memory {args.ram} --ipconfig0 ip=dhcp --searchdomain home.teknibauer.com")
+    run_command(f"qm resize {args.vmid} scsi0 {args.disk}G")
+
+    # 4. Finalize
+    print("--- [4/4] Starting VM ---")
+    run_command(f"qm cloudinit update {args.vmid}")
+    run_command(f"qm start {args.vmid}")
+
+    print(f"\nSuccessfully deployed {args.name}!\nIP will appear in Proxmox shortly via Guest Agent.")
+
+if __name__ == "__main__":
+    main()
