@@ -8,10 +8,11 @@ TEMPLATE_ID = "9000"
 EXPECTED_SNIPPET = "local:snippets/sa-user.yaml"
 DEFAULT_STORAGE = "nas-vm1"
 DEFAULT_DISK = 20
-DEFAULT_RAM = 2048
-DEFAULT_CORES = 2
+DEFAULT_RAM = 2048  # MB
+DEFAULT_CORES = 2   # Standard for home lab VMs
 
 def run_command(cmd, error_msg=None):
+    """Helper to run shell commands and exit on failure."""
     try:
         result = subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
         return result.stdout
@@ -22,29 +23,35 @@ def run_command(cmd, error_msg=None):
 
 def main():
     parser = argparse.ArgumentParser(description="Deploy a Proxmox VM from a validated template.")
-    parser.add_argument("vmid", help="The ID for the new VM")
-    parser.add_argument("name", help="The name for the new VM")
-    parser.add_argument("-d", "--disk", type=int, default=DEFAULT_DISK, help="Disk size in GB")
-    parser.add_argument("-r", "--ram", type=int, default=DEFAULT_RAM, help="RAM in MB")
-    parser.add_argument("-c", "--cores", type=int, default=DEFAULT_CORES, help="CPU Cores")
-    parser.add_argument("-s", "--storage", default=DEFAULT_STORAGE, help="Target storage ID")
+    
+    # Required Positional Arguments
+    parser.add_argument("vmid", help="The ID for the new VM (e.g., 110)")
+    parser.add_argument("name", help="The name for the new VM (e.g., openclaw-sandbox)")
+    
+    # Optional Flagged Arguments
+    parser.add_argument("-d", "--disk", type=int, default=DEFAULT_DISK, help=f"Disk size in GB (default: {DEFAULT_DISK})")
+    parser.add_argument("-r", "--ram", type=int, default=DEFAULT_RAM, help=f"RAM in MB (default: {DEFAULT_RAM})")
+    parser.add_argument("-c", "--cores", type=int, default=DEFAULT_CORES, help=f"CPU cores (default: {DEFAULT_CORES})")
+    parser.add_argument("-s", "--storage", default=DEFAULT_STORAGE, help=f"Target storage ID (default: {DEFAULT_STORAGE})")
     
     args = parser.parse_args()
 
     # 1. Validate Template
     print(f"--- [1/4] Validating Template {TEMPLATE_ID} ---")
-    config = run_command(f"qm config {TEMPLATE_ID}")
+    config = run_command(f"qm config {TEMPLATE_ID}", "Could not read template configuration.")
     if f"user={EXPECTED_SNIPPET}" not in config:
-        print(f"ERROR: Template {TEMPLATE_ID} is missing snippet: {EXPECTED_SNIPPET}")
+        print(f"ERROR: Template {TEMPLATE_ID} is out of spec (missing snippet: {EXPECTED_SNIPPET})")
         sys.exit(1)
 
-    # 2. Clone
+    # 2. Clone Template
     print(f"--- [2/4] Cloning to {args.storage} ---")
     run_command(f"qm clone {TEMPLATE_ID} {args.vmid} --name {args.name} --full --storage {args.storage}")
 
-    # 3. Specialize
+    # 3. Specialize Hardware (Cores, Disk, RAM, Network)
     print(f"--- [3/4] Customizing: {args.cores} Cores, {args.ram}MB RAM, {args.disk}GB Disk ---")
+    # Set Cores, RAM, and Network
     run_command(f"qm set {args.vmid} --cores {args.cores} --memory {args.ram} --ipconfig0 ip=dhcp --searchdomain home.teknibauer.com")
+    # Resize Disk
     run_command(f"qm resize {args.vmid} scsi0 {args.disk}G")
 
     # 4. Finalize
@@ -52,7 +59,10 @@ def main():
     run_command(f"qm cloudinit update {args.vmid}")
     run_command(f"qm start {args.vmid}")
 
-    print(f"\nSuccessfully deployed {args.name}!\nIP will appear in Proxmox shortly via Guest Agent.")
+    print("-" * 50)
+    print(f"Successfully deployed {args.name} ({args.vmid})")
+    print(f"Storage: {args.storage} | Cores: {args.cores} | RAM: {args.ram}MB | Disk: {args.disk}GB")
+    print("-" * 50)
 
 if __name__ == "__main__":
     main()
