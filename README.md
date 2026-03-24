@@ -15,7 +15,7 @@ This workflow uses the **Golden Image** philosophy. Instead of manual ISO instal
 | Script | Language | Description |
 | :--- | :--- | :--- |
 | `create-vm-template` | Bash | Downloads the Ubuntu Cloud Image, sets VirtIO hardware, and creates Template 9000. |
-| `deploy-vm` | Python | Clones the template, specializes RAM/Cores/Disk, and injects Cloud-Init identity. |
+| `create-vm` | Python | Clones the template, specializes RAM/Cores/Disk, and injects Cloud-Init identity. |
 | `destroy-vm` | Python | Safely stops and purges VMs. Includes an interactive picker and a protected-list check. |
 
 ## 📋 Setup & Prerequisites
