@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+import os
+import re
+import sys
+import argparse
+import subprocess
+import tomllib  # Use 'import tomli as tomllib' for Python < 3.11
+
+CONFIG_PATH = os.path.expanduser("~/.config/vmx-to-qm")
+
+def parse_vmx(vmx_path):
+    data = {}
+    with open(vmx_path, 'r') as f:
+        for line in f:
+            if '=' in line:
+                key, val = line.split('=', 1)
+                data[key.strip()] = val.strip().strip('"')
+    
+    # Extract disks
+    disks = []
+    # Match scsi0:0.fileName, scsi0:1.fileName, etc.
+    for key, val in data.items():
+        if '.fileName' in key and val.endswith('.vmdk'):
+            disks.append(val)
+    
+    return data, disks
+
+def get_user_input(prompt, default):
+    user_val = input(f"{prompt} [{default}]: ").strip()
+    return user_val if user_val else default
+
+def main():
+    parser = argparse.ArgumentParser(description="Migrate VMX to Proxmox QM")
+    parser.add_argument("vmx_file", help="Path to the .vmx file")
+    parser.add_argument("--for-real", action="store_true", help="Execute the commands")
+    args = parser.parse_args()
+
+    # 1. Load Config
+    try:
+        with open(CONFIG_PATH, "rb") as f:
+            config = tomllib.load(f)
+    except FileNotFoundError:
+        print(f"Error: Config not found at {CONFIG_PATH}")
+        sys.exit(1)
+
+    storage = config['proxmox'].get('default_storage', 'local-lvm')
+    vmx_dir = os.path.dirname(os.path.abspath(args.vmx_file))
+    vmx_data, disks = parse_vmx(args.vmx_file)
+
+    # 2. Analyze & Recommend
+    print(f"\n--- Analyzing: {os.path.basename(args.vmx_file)} ---")
+    orig_name = vmx_data.get('displayName', 'Unknown')
+    orig_mem = vmx_data.get('memsize', '2048')
+    orig_cpus = vmx_data.get('numvcpus', '1')
+
+    # 3. Interactive Prompts
+    new_name = get_user_input("Enter new Proxmox VM Name", f"Migrated-{orig_name}")
+    vmid = get_user_input("Enter new VM ID", "100")
+    memory = get_user_input("Confirm RAM (MB)", orig_mem)
+    net_model = get_user_input("Network Model (e1000/virtio)", "e1000")
+    scsi_ctrl = get_user_input("SCSI Controller (LSI 53C895A/VirtIO SCSI)", "LSI 53C895A")
+
+    # 4. Generate Commands
+    commands = [
+        # Create the shell VM
+        f"qm create {vmid} --name '{new_name}' --memory {memory} --net0 {net_model},bridge=vmbr0 --scsihw '{scsi_ctrl}' --ostype l26"
+    ]
+
+    # Import each disk
+    for i, disk in enumerate(sorted(disks)):
+        full_disk_path = os.path.join(vmx_dir, disk)
+        commands.append(f"qm importdisk {vmid} '{full_disk_path}' {storage}")
+        # Note: We don't know the exact resulting name until import, 
+        # but Proxmox usually follows vm-ID-disk-X
+        commands.append(f"echo 'Manually attach unused disk to scsi{i} and set boot order in GUI.'")
+
+    # 5. Output / Execution
+    print("\n--- Migration Plan ---")
+    for cmd in commands:
+        print(f"  {cmd}")
+
+    if args.for_real:
+        confirm = input("\nExecute these commands now? (y/N): ")
+        if confirm.lower() == 'y':
+            for cmd in commands:
+                if "echo" in cmd: continue
+                print(f"Running: {cmd}...")
+                subprocess.run(cmd, shell=True)
+        else:
+            print("Execution cancelled.")
+    else:
+        print("\nRun with --for-real to execute these commands automatically.")
+
+if __name__ == "__main__":
+    main()
