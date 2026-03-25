@@ -8,101 +8,120 @@ import shutil
 
 CONFIG_PATH = os.path.expanduser("~/.config/vmx-to-qm")
 
-def get_storage_path(storage_name):
-    """Retrieves the actual mount point for a Proxmox storage ID."""
-    try:
-        output = subprocess.check_output(['pvesm', 'path', f'{storage_name}:vm-101-disk-0'], stderr=subprocess.STDOUT).decode()
-        # Returns something like /mnt/pve/nas-vm1/images/101/vm-101-disk-0.raw
-        # We just want the base mount point
-        return output.split('/images/')[0]
-    except subprocess.CalledProcessError:
-        # Fallback: Many NAS mounts are in /mnt/pve/STORAGE_NAME
-        return f"/mnt/pve/{storage_name}"
+def check_proxmox():
+    if shutil.which('pveversion') is None:
+        print("Error: This script must be run on a Proxmox node.")
+        sys.exit(1)
 
-def check_free_space(storage_name, required_bytes):
-    path = get_storage_path(storage_name)
-    usage = shutil.disk_usage(path)
-    # Give ourselves a 5% buffer
-    return usage.free > (required_bytes * 1.05)
+def get_storage_type(storage_name):
+    """Detects if storage is a Directory/NAS vs Block (LVM/ZFS)."""
+    try:
+        output = subprocess.check_output(['pvesm', 'status', '--storage', storage_name]).decode()
+        if any(t in output.lower() for t in ['dir', 'nfs', 'cifs', 'gluster']):
+            return 'directory'
+    except:
+        pass
+    return 'block'
 
 def parse_vmx(vmx_path):
-    data = {}
+    vmx_data = {}
     with open(vmx_path, 'r') as f:
         for line in f:
             if '=' in line:
                 key, val = line.split('=', 1)
-                data[key.strip()] = val.strip().strip('"')
+                vmx_data[key.strip().lower()] = val.strip().strip('"')
     
     vmx_dir = os.path.dirname(os.path.abspath(vmx_path))
     disks = []
     total_size = 0
     
-    for key, val in data.items():
-        if '.fileName' in key and val.endswith('.vmdk'):
+    total_vcpus = int(vmx_data.get('numvcpus', 1))
+    cores_per_socket = int(vmx_data.get('cpuid.corespersocket', 1))
+    sockets = total_vcpus // cores_per_socket
+    if sockets == 0: sockets = 1
+
+    for key, val in vmx_data.items():
+        if '.filename' in key and val.endswith('.vmdk'):
             disks.append(val)
-            # Find the actual -flat.vmdk or .vmdk size on disk
+            # Check for -flat version first, then descriptor
             flat_file = os.path.join(vmx_dir, val.replace('.vmdk', '-flat.vmdk'))
-            descriptor_file = os.path.join(vmx_dir, val)
-            
             if os.path.exists(flat_file):
                 total_size += os.path.getsize(flat_file)
-            elif os.path.exists(descriptor_file):
-                total_size += os.path.getsize(descriptor_file)
+            elif os.path.exists(os.path.join(vmx_dir, val)):
+                total_size += os.path.getsize(os.path.join(vmx_dir, val))
                 
-    return data, sorted(disks), total_size
+    return vmx_data, sorted(disks), total_size, sockets, cores_per_socket
 
 def main():
+    check_proxmox()
     parser = argparse.ArgumentParser(description="Migrate VMX to Proxmox QM")
     parser.add_argument("vmx_file", help="Path to the .vmx file")
+    parser.add_argument("--name", help="New VM Name")
+    parser.add_argument("--vmid", help="New VM ID")
     parser.add_argument("--for-real", action="store_true", help="Execute the commands")
+    parser.add_argument("--modern", action="store_true", help="Use VirtIO and Q35")
     args = parser.parse_args()
 
     # Load Config
     with open(CONFIG_PATH, "rb") as f:
         config = tomllib.load(f)
     storage = config['proxmox'].get('default_storage', 'local-lvm')
+    s_type = get_storage_type(storage)
     
     vmx_dir = os.path.dirname(os.path.abspath(args.vmx_file))
-    vmx_data, disks, total_size_bytes = parse_vmx(args.vmx_file)
+    vmx_data, disks, total_size_bytes, sockets, cores = parse_vmx(args.vmx_file)
 
-    # User Input
-    orig_name = vmx_data.get('displayName', 'Unknown')
-    new_name = input(f"New VM Name [Migrated-{orig_name}]: ") or f"Migrated-{orig_name}"
-    vmid = input("New VM ID [100]: ") or "100"
-    
-    # Space Check
-    total_gb = total_size_bytes / (1024**3)
-    print(f"\nTargeting storage: {storage} (Needs ~{total_gb:.2f} GB)")
-    
-    if not check_free_space(storage, total_size_bytes):
-        print(f"!!! ERROR: Insufficient space on {storage}. Migration aborted.")
-        sys.exit(1)
+    new_name = args.name or f"Migrated-{vmx_data.get('displayname', 'VM')}"
+    vmid = args.vmid or "100"
 
-    # Build Command List
+    # Hardware Profile (Always CPU Host for Nextcloud)
+    cpu_type = "host"
+    if args.modern:
+        net_model, scsi_ctrl, machine = "virtio", "virtio-scsi-pci", "q35"
+        mode_str = "MODERN"
+    else:
+        net_model, scsi_ctrl, machine = "e1000", "lsi", "pc"
+        mode_str = "COMPATIBILITY"
+    
     commands = [
         f"qm create {vmid} --name '{new_name}' --memory {vmx_data.get('memsize', '2048')} "
-        f"--net0 {config['proxmox'].get('net_model', 'e1000')},bridge=vmbr0 "
-        f"--scsihw 'LSI 53C895A' --ostype l26"
+        f"--sockets {sockets} --cores {cores} --cpu {cpu_type} "
+        f"--net0 {net_model},bridge=vmbr0 --scsihw '{scsi_ctrl}' --machine {machine} --ostype l26"
     ]
 
     for i, disk in enumerate(disks):
         full_disk_path = os.path.join(vmx_dir, disk)
+        # 1. Import command
         commands.append(f"qm importdisk {vmid} '{full_disk_path}' {storage}")
-        # Map to the specific disk name Proxmox generates
-        commands.append(f"qm set {vmid} --scsi{i} {storage}:vm-{vmid}-disk-{i}")
+        
+        # 2. Set/Attach command logic
+        if s_type == 'directory':
+            # Format required for NAS: <storage>:<vmid>/vm-<vmid>-disk-<index>.raw
+            disk_volid = f"{storage}:{vmid}/vm-{vmid}-disk-{i}.raw"
+        else:
+            # Format for Block: <storage>:vm-<vmid>-disk-<index>
+            disk_volid = f"{storage}:vm-{vmid}-disk-{i}"
+            
+        commands.append(f"qm set {vmid} --scsi{i} {disk_volid}")
 
+    # Set Boot Order
     commands.append(f"qm set {vmid} --boot order=scsi0")
 
-    print("\n--- Migration Plan ---")
+    print(f"\n--- Migration Plan [{mode_str}] ---")
     for cmd in commands: print(f"  {cmd}")
 
     if args.for_real:
-        if input("\nProceed? (y/N): ").lower() == 'y':
+        if input(f"\nProceed with migration to {storage}? (y/N): ").lower() == 'y':
             for cmd in commands:
                 print(f"Executing: {cmd}")
-                subprocess.run(cmd, shell=True, check=True)
+                try:
+                    subprocess.run(cmd, shell=True, check=True)
+                except subprocess.CalledProcessError as e:
+                    print(f"Error during execution: {e}")
+                    sys.exit(1)
+            print("\nMigration Complete. Verify hardware settings and start the VM.")
     else:
-        print("\nRun with --for-real to execute.")
+        print("\nReady! Use --for-real to execute.")
 
 if __name__ == "__main__":
     main()
