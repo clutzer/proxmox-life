@@ -76,7 +76,7 @@ def main():
 
     # 4. Specialize Hardware
     print(f"--- [4/5] Customizing: {args.cores} Cores, {args.ram}MB RAM, {args.disk}GB Disk ---")
-    run_command(f"qm set {args.vmid} --cores {args.cores} --memory {args.ram} --ipconfig0 ip=dhcp --searchdomain home.teknibauer.com")
+    run_command(f"qm set {args.vmid} --machine q35 --cores {args.cores} --memory {args.ram} --ipconfig0 ip=dhcp --searchdomain home.teknibauer.com")
     run_command(f"qm resize {args.vmid} scsi0 {args.disk}G")
 
     # 5. Finalize
