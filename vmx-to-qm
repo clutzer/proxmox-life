@@ -1,12 +1,29 @@
 #!/usr/bin/env python3
 import os
-import re
 import sys
 import argparse
 import subprocess
-import tomllib  # Use 'import tomli as tomllib' for Python < 3.11
+import tomllib
+import shutil
 
 CONFIG_PATH = os.path.expanduser("~/.config/vmx-to-qm")
+
+def get_storage_path(storage_name):
+    """Retrieves the actual mount point for a Proxmox storage ID."""
+    try:
+        output = subprocess.check_output(['pvesm', 'path', f'{storage_name}:vm-101-disk-0'], stderr=subprocess.STDOUT).decode()
+        # Returns something like /mnt/pve/nas-vm1/images/101/vm-101-disk-0.raw
+        # We just want the base mount point
+        return output.split('/images/')[0]
+    except subprocess.CalledProcessError:
+        # Fallback: Many NAS mounts are in /mnt/pve/STORAGE_NAME
+        return f"/mnt/pve/{storage_name}"
+
+def check_free_space(storage_name, required_bytes):
+    path = get_storage_path(storage_name)
+    usage = shutil.disk_usage(path)
+    # Give ourselves a 5% buffer
+    return usage.free > (required_bytes * 1.05)
 
 def parse_vmx(vmx_path):
     data = {}
@@ -16,18 +33,23 @@ def parse_vmx(vmx_path):
                 key, val = line.split('=', 1)
                 data[key.strip()] = val.strip().strip('"')
     
-    # Extract disks
+    vmx_dir = os.path.dirname(os.path.abspath(vmx_path))
     disks = []
-    # Match scsi0:0.fileName, scsi0:1.fileName, etc.
+    total_size = 0
+    
     for key, val in data.items():
         if '.fileName' in key and val.endswith('.vmdk'):
             disks.append(val)
-    
-    return data, disks
-
-def get_user_input(prompt, default):
-    user_val = input(f"{prompt} [{default}]: ").strip()
-    return user_val if user_val else default
+            # Find the actual -flat.vmdk or .vmdk size on disk
+            flat_file = os.path.join(vmx_dir, val.replace('.vmdk', '-flat.vmdk'))
+            descriptor_file = os.path.join(vmx_dir, val)
+            
+            if os.path.exists(flat_file):
+                total_size += os.path.getsize(flat_file)
+            elif os.path.exists(descriptor_file):
+                total_size += os.path.getsize(descriptor_file)
+                
+    return data, sorted(disks), total_size
 
 def main():
     parser = argparse.ArgumentParser(description="Migrate VMX to Proxmox QM")
@@ -35,61 +57,52 @@ def main():
     parser.add_argument("--for-real", action="store_true", help="Execute the commands")
     args = parser.parse_args()
 
-    # 1. Load Config
-    try:
-        with open(CONFIG_PATH, "rb") as f:
-            config = tomllib.load(f)
-    except FileNotFoundError:
-        print(f"Error: Config not found at {CONFIG_PATH}")
+    # Load Config
+    with open(CONFIG_PATH, "rb") as f:
+        config = tomllib.load(f)
+    storage = config['proxmox'].get('default_storage', 'local-lvm')
+    
+    vmx_dir = os.path.dirname(os.path.abspath(args.vmx_file))
+    vmx_data, disks, total_size_bytes = parse_vmx(args.vmx_file)
+
+    # User Input
+    orig_name = vmx_data.get('displayName', 'Unknown')
+    new_name = input(f"New VM Name [Migrated-{orig_name}]: ") or f"Migrated-{orig_name}"
+    vmid = input("New VM ID [100]: ") or "100"
+    
+    # Space Check
+    total_gb = total_size_bytes / (1024**3)
+    print(f"\nTargeting storage: {storage} (Needs ~{total_gb:.2f} GB)")
+    
+    if not check_free_space(storage, total_size_bytes):
+        print(f"!!! ERROR: Insufficient space on {storage}. Migration aborted.")
         sys.exit(1)
 
-    storage = config['proxmox'].get('default_storage', 'local-lvm')
-    vmx_dir = os.path.dirname(os.path.abspath(args.vmx_file))
-    vmx_data, disks = parse_vmx(args.vmx_file)
-
-    # 2. Analyze & Recommend
-    print(f"\n--- Analyzing: {os.path.basename(args.vmx_file)} ---")
-    orig_name = vmx_data.get('displayName', 'Unknown')
-    orig_mem = vmx_data.get('memsize', '2048')
-    orig_cpus = vmx_data.get('numvcpus', '1')
-
-    # 3. Interactive Prompts
-    new_name = get_user_input("Enter new Proxmox VM Name", f"Migrated-{orig_name}")
-    vmid = get_user_input("Enter new VM ID", "100")
-    memory = get_user_input("Confirm RAM (MB)", orig_mem)
-    net_model = get_user_input("Network Model (e1000/virtio)", "e1000")
-    scsi_ctrl = get_user_input("SCSI Controller (LSI 53C895A/VirtIO SCSI)", "LSI 53C895A")
-
-    # 4. Generate Commands
+    # Build Command List
     commands = [
-        # Create the shell VM
-        f"qm create {vmid} --name '{new_name}' --memory {memory} --net0 {net_model},bridge=vmbr0 --scsihw '{scsi_ctrl}' --ostype l26"
+        f"qm create {vmid} --name '{new_name}' --memory {vmx_data.get('memsize', '2048')} "
+        f"--net0 {config['proxmox'].get('net_model', 'e1000')},bridge=vmbr0 "
+        f"--scsihw 'LSI 53C895A' --ostype l26"
     ]
 
-    # Import each disk
-    for i, disk in enumerate(sorted(disks)):
+    for i, disk in enumerate(disks):
         full_disk_path = os.path.join(vmx_dir, disk)
         commands.append(f"qm importdisk {vmid} '{full_disk_path}' {storage}")
-        # Note: We don't know the exact resulting name until import, 
-        # but Proxmox usually follows vm-ID-disk-X
-        commands.append(f"echo 'Manually attach unused disk to scsi{i} and set boot order in GUI.'")
+        # Map to the specific disk name Proxmox generates
+        commands.append(f"qm set {vmid} --scsi{i} {storage}:vm-{vmid}-disk-{i}")
 
-    # 5. Output / Execution
+    commands.append(f"qm set {vmid} --boot order=scsi0")
+
     print("\n--- Migration Plan ---")
-    for cmd in commands:
-        print(f"  {cmd}")
+    for cmd in commands: print(f"  {cmd}")
 
     if args.for_real:
-        confirm = input("\nExecute these commands now? (y/N): ")
-        if confirm.lower() == 'y':
+        if input("\nProceed? (y/N): ").lower() == 'y':
             for cmd in commands:
-                if "echo" in cmd: continue
-                print(f"Running: {cmd}...")
-                subprocess.run(cmd, shell=True)
-        else:
-            print("Execution cancelled.")
+                print(f"Executing: {cmd}")
+                subprocess.run(cmd, shell=True, check=True)
     else:
-        print("\nRun with --for-real to execute these commands automatically.")
+        print("\nRun with --for-real to execute.")
 
 if __name__ == "__main__":
     main()
