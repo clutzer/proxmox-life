@@ -5,7 +5,7 @@ import re
 
 def parse_vmx(file_path):
     config = {}
-    # Use a regex to capture key-value pairs while stripping quotes
+    # Captures key-value pairs; strips quotes and handles potential whitespace
     pattern = re.compile(r'^([\w\.:0-9]+)\s*=\s*"(.*)"')
     
     try:
@@ -13,29 +13,32 @@ def parse_vmx(file_path):
             for line in f:
                 match = pattern.match(line.strip())
                 if match:
-                    config[match.group(1)] = match.group(2)
+                    # Force key to lowercase for case-insensitive lookup
+                    config[match.group(1).lower()] = match.group(2)
     except FileNotFoundError:
-        return "Error: File not found."
+        return print(f"Error: File '{file_path}' not found.")
 
-    # Calculation logic for Sockets/Cores
+    # Logic using lowercase keys
     total_vcpus = int(config.get('numvcpus', 1))
-    cores_per_socket = int(config.get('cpuid.coresPerSocket', 1))
+    cores_per_socket = int(config.get('cpuid.corespersocket', 1))
     sockets = total_vcpus // cores_per_socket
 
-    # Extracting Disk Information
-    disks = [val for key, val in config.items() if '.fileName' in key and val.endswith('.vmdk')]
+    # Extracting Disk and Network info
+    disks = [val for key, val in config.items() if '.filename' in key and val.endswith('.vmdk')]
+    net_type = config.get('ethernet0.virtualdev', 'e1000')
+    scsi_type = config.get('scsi0.virtualdev', 'lsilogic')
 
-    print(f"--- Migration Profile: {config.get('displayName', 'Unknown VM')} ---")
+    print(f"--- Migration Profile: {config.get('displayname', 'Unknown VM')} ---")
     print(f"CPU Sockets:      {sockets}")
     print(f"Cores per Socket: {cores_per_socket}")
     print(f"Total vCPUs:      {total_vcpus}")
     print(f"RAM (MB):         {config.get('memsize', '0')}")
-    print(f"Guest OS Type:    {config.get('guestOS', 'Unknown')}")
-    print(f"Firmware Mode:    {'UEFI' if config.get('firmware') == 'efi' else 'BIOS (Legacy)'}")
-    print(f"SCSI Controller:  {config.get('scsi0.virtualDev', 'lsilogic')}")
-    print(f"Network Adapter:  {config.get('ethernet0.virtualDev', 'e1000')}")
+    print(f"Guest OS:         {config.get('guestos', 'Unknown')}")
+    print(f"Firmware:         {'UEFI' if config.get('firmware') == 'efi' else 'BIOS (Legacy)'}")
+    print(f"SCSI Controller:  {scsi_type}")
+    print(f"Network Adapter:  {net_type}")
     print(f"Virtual Disks:    {', '.join(disks)}")
-    print("-" * 40)
+    print("-" * 45)
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
